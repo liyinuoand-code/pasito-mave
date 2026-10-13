@@ -70,25 +70,79 @@ const CONCEPTS=[
 ];
 const IC = n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" aria-hidden="true"><use href="#i-${n}"></use></svg>`;
 const esc=v=>String(v??'').replace(/[&<>"']/g,s=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
-function localDate(d=new Date()){return [d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-')}
-function dateFrom(s){let [y,m,d]=s.split('-').map(Number);return new Date(y,m-1,d)}
-function dayPlus(s,n){let d=dateFrom(s);d.setDate(d.getDate()+n);return localDate(d)}
+const TIMEZONE='Europe/Madrid';
+const madridDayParts=new Intl.DateTimeFormat('en-GB',{timeZone:TIMEZONE,year:'numeric',month:'2-digit',day:'2-digit'});
+function localDate(d=new Date()){const p={};for(const x of madridDayParts.formatToParts(d)){if(x.type!=='literal')p[x.type]=x.value}return [p.year,p.month,p.day].join('-')}
+function dateFrom(s){let[y,m,d]=s.split('-').map(Number);return new Date(Date.UTC(y,m-1,d,12))}
+function dayPlus(s,n){const d=dateFrom(s);d.setUTCDate(d.getUTCDate()+n);return [d.getUTCFullYear(),String(d.getUTCMonth()+1).padStart(2,'0'),String(d.getUTCDate()).padStart(2,'0')].join('-')}
 function dayDiff(a,b){return Math.round((dateFrom(a)-dateFrom(b))/DAY_MS)}
 function clamp(v,a,b){return Math.min(b,Math.max(a,v))}
 function shuffle(arr){const a=arr.slice();for(let i=a.length-1;i>0;i--){let j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a}
 function load(){try{let s=JSON.parse(localStorage.getItem(STORE));if(s&&typeof s==='object')return normalize(s)}catch(e){}return normalize({})}
 function validDailyGoal(value){const n=Number(value);return String(value??'').trim()!==''&&Number.isSafeInteger(n)&&n>=1}
-function normalize(s){return {checkins:Array.isArray(s.checkins)?s.checkins:[],reviews:s.reviews&&typeof s.reviews==='object'?s.reviews:{},logs:s.logs&&typeof s.logs==='object'?s.logs:{},notes:s.notes&&typeof s.notes==='object'?s.notes:{},favorites:Array.isArray(s.favorites)?s.favorites:[],listenDone:s.listenDone&&typeof s.listenDone==='object'?s.listenDone:{},settings:{goal:validDailyGoal(s.settings?.goal)?Number(s.settings.goal):10,planCategory:['MAVE','B1','B2','ALL'].includes(s.settings?.planCategory)?s.settings.planCategory:'ALL'}}}
+function normalize(s){
+ const raw=s.dailyTasks&&typeof s.dailyTasks==='object'&&!Array.isArray(s.dailyTasks)?s.dailyTasks:{},dailyTasks={};
+ for(const [date,task] of Object.entries(raw)){
+  if(/^\d{4}-\d{2}-\d{2}$/.test(date)&&task&&validDailyGoal(task.goal)&&['MAVE','B1','B2','ALL'].includes(task.category))dailyTasks[date]={goal:Number(task.goal),category:task.category};
+ }
+ return {checkins:Array.isArray(s.checkins)?s.checkins:[],reviews:s.reviews&&typeof s.reviews==='object'?s.reviews:{},logs:s.logs&&typeof s.logs==='object'?s.logs:{},notes:s.notes&&typeof s.notes==='object'?s.notes:{},favorites:Array.isArray(s.favorites)?s.favorites:[],listenDone:s.listenDone&&typeof s.listenDone==='object'?s.listenDone:{},settings:{goal:validDailyGoal(s.settings?.goal)?Number(s.settings.goal):10,planCategory:['MAVE','B1','B2','ALL'].includes(s.settings?.planCategory)?s.settings.planCategory:'ALL'},dailyTasks};
+}
 let state=load();
+let taskStatusCache=null;
 let ui={view:'home',vocabTab:'cards',category:'ALL',scope:'today',queue:[],queueAt:0,flip:false,wordSearch:'',wordListCategory:'ALL',quizMode:'multiple',quizQueue:[],quizAt:0,quizOptions:[],quizAnswer:null,quizTyped:'',quizScore:0,listenIndex:0,listenReveal:false,listenText:false,settingsOpen:false};
 let toastTimer;
-function save(){try{localStorage.setItem(STORE,JSON.stringify(state));return true}catch(e){toast('浏览器未能保存进度，请用设置中的“导出备份”保存。');return false}}
+let renderedMadridDate=localDate();
+function save(){taskStatusCache=null;try{localStorage.setItem(STORE,JSON.stringify(state));return true}catch(e){toast('浏览器未能保存进度，请用设置中的“导出备份”保存。');return false}}
 function toast(message){const e=document.getElementById('toast');e.textContent=message;e.classList.add('on');clearTimeout(toastTimer);toastTimer=setTimeout(()=>e.classList.remove('on'),2900)}
 function todayLog(){const t=localDate();state.logs[t] ||= {ids:[],correct:0,wrong:0};if(!Array.isArray(state.logs[t].ids))state.logs[t].ids=[];return state.logs[t]}
 function studiedToday(){return (state.logs[localDate()]?.ids||[]).length}
 function planLabel(category){return category==='ALL'?'全部词库':labelCat(category)}
-function studiedForPlan(){const ids=state.logs[localDate()]?.ids||[];const category=state.settings.planCategory;if(category==='ALL')return ids.length;const categoryIds=new Set(WORDS.filter(w=>w.cat===category).map(w=>w.id));return ids.filter(id=>categoryIds.has(id)).length}
-function planRemaining(){return Math.max(0,state.settings.goal-studiedForPlan())}
+function studiedForPlan(){return todayTaskStatus().done}
+function ensureDailyTasks(){
+ const today=localDate(),all=Object.keys(state.dailyTasks).sort();let changed=false;
+ if(!all.length){state.dailyTasks[today]={goal:state.settings.goal,category:state.settings.planCategory};changed=true}
+ else{
+  let latest=all[all.length-1];
+  while(latest<today){latest=dayPlus(latest,1);if(!state.dailyTasks[latest]){state.dailyTasks[latest]={goal:state.settings.goal,category:state.settings.planCategory};changed=true}}
+  if(!state.dailyTasks[today]){state.dailyTasks[today]={goal:state.settings.goal,category:state.settings.planCategory};changed=true}
+ }
+ if(changed)save();
+}
+function taskStatuses(){
+ const day=localDate();
+ if(taskStatusCache?.day===day)return taskStatusCache.items;
+ ensureDailyTasks();
+ const tasks=Object.entries(state.dailyTasks).filter(([date])=>date<=day).sort((a,b)=>a[0].localeCompare(b[0])).map(([date,t])=>({date,goal:t.goal,category:t.category,done:0}));
+ const wordsById=new Map(WORDS.map(w=>[w.id,w]));
+ for(const studiedDate of Object.keys(state.logs).sort()){
+  if(studiedDate>day)continue;
+  const seen=new Set();
+  for(const id of state.logs[studiedDate]?.ids||[]){
+   if(seen.has(id))continue;seen.add(id);
+   const word=wordsById.get(id);if(!word)continue;
+   const target=tasks.find(t=>t.date<=studiedDate&&t.done<t.goal&&(t.category==='ALL'||t.category===word.cat));
+   if(target)target.done++;
+  }
+ }
+ const items=tasks.map(t=>({...t,remaining:t.goal-t.done,overdue:t.date<day&&t.done<t.goal}));
+ taskStatusCache={day,items};
+ return items;
+}
+function todayTaskStatus(){return taskStatuses().find(t=>t.date===localDate())||{date:localDate(),goal:state.settings.goal,category:state.settings.planCategory,done:0,remaining:state.settings.goal,overdue:false}}
+function overdueTasks(){return taskStatuses().filter(t=>t.overdue)}
+function overdueRemaining(){return overdueTasks().reduce((sum,t)=>sum+t.remaining,0)}
+function planRemaining(){return taskStatuses().reduce((sum,t)=>sum+t.remaining,0)}
+function plannedVocabularyQueue(){
+ const used=new Set(state.logs[localDate()]?.ids||[]),selected=new Set(),output=[],today=localDate();
+ for(const task of taskStatuses().filter(t=>t.remaining>0)){
+  const eligible=WORDS.filter(w=>!used.has(w.id)&&!selected.has(w.id)&&(task.category==='ALL'||w.cat===task.category));
+  const due=eligible.filter(w=>state.reviews[w.id]&&state.reviews[w.id].due<=today);
+  const newer=eligible.filter(w=>!state.reviews[w.id]);
+  const later=eligible.filter(w=>state.reviews[w.id]&&state.reviews[w.id].due>today);
+  for(const w of [...shuffle(due),...shuffle(newer),...shuffle(later)].slice(0,task.remaining)){selected.add(w.id);output.push(w.id)}
+ }
+ return output;
+}
 function reviewDue(){return WORDS.filter(w=>state.reviews[w.id]&&state.reviews[w.id].due<=localDate()).length}
 function mastered(){return Object.values(state.reviews).filter(r=>r.reps>=3).length}
 function checkinStreak(){let s=new Set(state.checkins),d=localDate();if(!s.has(d))d=dayPlus(d,-1);let n=0;while(s.has(d)){n++;d=dayPlus(d,-1)}return n}
@@ -98,18 +152,17 @@ function rateWord(w,grade){const prev=state.reviews[w.id]||{reps:0,interval:0,ea
  state.reviews[w.id]={reps,ease,interval,due:dayPlus(localDate(),interval),last:localDate(),grade};recordStudy(w,grade>0)
 }
 function checkIn(){const d=localDate();if(!state.checkins.includes(d)){state.checkins.push(d);state.checkins.sort();save();toast('今日打卡成功。谢谢你为自己留出学习时间 🌿')}else toast('今天已经打卡啦。明天再来就好。');render()}
-function fmtDate(){return new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'long'}).format(new Date())}
+function fmtDate(){return new Intl.DateTimeFormat('zh-CN',{timeZone:TIMEZONE,month:'long',day:'numeric',weekday:'long'}).format(new Date())}
 function labelCat(cat){return cat==='MAVE'?'MAVE 专业':'DELE '+cat}
 function nav(v){ui.view=v;render();window.scrollTo({top:0,behavior:'auto'})}
-function setQueue(){const today=localDate();let pool=WORDS.filter(w=>ui.category==='ALL'||w.cat===ui.category);
+function setQueue(){
+ const today=localDate();
+ if(ui.scope==='today'){ui.category='ALL';ui.queue=plannedVocabularyQueue();ui.queueAt=0;ui.flip=false;return}
+ let pool=WORDS.filter(w=>ui.category==='ALL'||w.cat===ui.category);
  let due=pool.filter(w=>state.reviews[w.id]&&state.reviews[w.id].due<=today);
  let newer=pool.filter(w=>!state.reviews[w.id]);
  let rest=pool.filter(w=>state.reviews[w.id]&&state.reviews[w.id].due>today);
- if(ui.scope==='today'){
-   const studiedIds=new Set(state.logs[today]?.ids||[]);
-   pool=[...shuffle(due),...newer,...shuffle(rest)].filter(w=>!studiedIds.has(w.id)).slice(0,planRemaining());
- }
- else if(ui.scope==='new')pool=newer;
+ if(ui.scope==='new')pool=newer;
  else if(ui.scope==='due')pool=due;
  else if(ui.scope==='favorites')pool=pool.filter(w=>state.favorites.includes(w.id));
  else if(ui.scope==='smart')pool=[...shuffle(due),...newer,...shuffle(rest)];
@@ -122,26 +175,29 @@ function answerQuiz(value){if(ui.quizAnswer!==null)return;const w=ui.quizQueue[u
 function cleanTerm(v){return String(v||'').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[¿?¡!.,;:()«»]/g,'').replace(/\s+/g,' ')}
 function playSpanish(text,slow=false){if(!('speechSynthesis' in window)){toast('此浏览器暂不支持语音朗读。');return}try{speechSynthesis.cancel();const s=new SpeechSynthesisUtterance(text);s.lang='es-ES';s.rate=slow?.75:.91;s.pitch=1;const vs=speechSynthesis.getVoices();const v=vs.find(x=>x.lang.toLowerCase()==='es-es')||vs.find(x=>x.lang.toLowerCase().startsWith('es'));if(v)s.voice=v;speechSynthesis.speak(s)}catch(e){toast('语音没有启动，请检查浏览器的语音权限。')}}
 function iconStat(n){return `<span>${IC(n)}</span>`}
-function weeklyMini(){const current=localDate();let dt=dateFrom(current);let mon=new Date(dt);mon.setDate(dt.getDate()-((dt.getDay()+6)%7));return `<div class="weekly-grid">${Array.from({length:7},(_,i)=>{let d=new Date(mon);d.setDate(mon.getDate()+i);let s=localDate(d),signed=state.checkins.includes(s),future=dayDiff(s,current)>0;return `<div class="week-day"><div class="weekday">${['一','二','三','四','五','六','日'][i]}</div><div class="bubble ${signed?'signed':''} ${s===current?'today':''} ${future?'future':''}">${signed?'✓':d.getDate()}</div></div>`}).join('')}</div>`}
-function renderHome(){let goal=state.settings.goal,studied=studiedForPlan(),due=reviewDue(),signed=state.checkins.includes(localDate()),categoryLabel=planLabel(state.settings.planCategory);return `
+function weeklyMini(){
+ const current=localDate(),first=dayPlus(current,-((dateFrom(current).getUTCDay()+6)%7));
+ return `<div class="weekly-grid">${Array.from({length:7},(_,i)=>{const d=dayPlus(first,i),signed=state.checkins.includes(d),future=dayDiff(d,current)>0;return `<div class="week-day"><div class="weekday">${['一','二','三','四','五','六','日'][i]}</div><div class="bubble ${signed?'signed':''} ${d===current?'today':''} ${future?'future':''}">${signed?'✓':Number(d.slice(-2))}</div></div>`}).join('')}</div>`;
+}
+function renderHome(){let currentTask=todayTaskStatus(),goal=currentTask.goal,studied=currentTask.done,due=reviewDue(),signed=state.checkins.includes(localDate()),categoryLabel=planLabel(currentTask.category),late=overdueTasks(),lateCount=overdueRemaining();const lateList=late.slice(0,5).map(t=>`<div class="task"><div class="task-mark">${IC('refresh')}</div><div><div class="task-title">${esc(t.date)} · ${esc(planLabel(t.category))}</div><div class="task-desc">原定 ${t.goal} 个 · 已完成 ${t.done} 个 · 逾期 ${t.remaining} 个</div></div><span class="tiny-badge orange">逾期</span></div>`).join('');return `
  <div class="hero"><div><div class="eyebrow">TU ESPACIO DE APRENDIZAJE · MAVE</div><h1>慢慢来，<br>也在向前走。</h1><p>每天一点学术西语，让你在教室里更自在地听懂、思考、表达。</p><div class="actions"><button class="btn btn-primary btn-lg" data-action="goVocab">${IC('book')} 按我的选择背词</button><button class="btn btn-white btn-lg" data-action="goPlan">${IC('calendar')} 打开我的词库</button></div></div><div class="hero-art"><div class="orb"><div class="es">paso a paso</div><div class="sub">UN DÍA A LA VEZ</div></div></div></div>
  <div class="grid4">
-  ${stat('今日自选',studied+' / '+goal,categoryLabel+' · 不同词条','book')}
-  ${stat('已接触词汇',Object.keys(state.reviews).length,'专业 + DELE','layers')}
+  ${stat('今日自选',studied+' / '+goal,categoryLabel+' · 今天的词','book')}
+  ${stat('逾期待补',lateCount+' 个',late.length+' 个历史日期 · 00:00 结算','refresh')}
   ${stat('待复习',due,'个到期词条','refresh')}
   ${stat('连续打卡',checkinStreak()+' 天','不追求完美连续','flame')}
  </div>
- <div class="columns"><div class="panel"><div class="row-between"><h3>今天的自由背词 · ${esc(categoryLabel)}</h3><button class="btn btn-ghost btn-sm" data-action="goPlan">我的词库 ${IC('arrow')}</button></div><div class="progress-head"><strong>${studied>=goal?'今天练到自己选的数量啦 ✨':'已练 '+studied+' / '+goal+' 个词 · 参考剩余 '+(goal-studied)+' 个'}</strong><span>${Math.round(100*Math.min(studied/goal,1))}%</span></div><div class="progress-track"><div class="progress-fill" style="width:${Math.min(studied/goal*100,100)}%"></div></div><div class="goal-note">这是你自己选的参考数量：${esc(categoryLabel)} · ${goal} 个。没完成不会累积到下一天；单词卡自动记录，不必手抄。</div><div class="section-heading"><h2>我的打卡足迹（可选）</h2><span class="hint">打卡一次就够</span></div>${weeklyMini()}<div class="checkin-zone"><button class="btn ${signed?'btn-soft':'btn-primary'}" data-action="checkin">${IC('check')} ${signed?'今天已打卡':'完成今日打卡'}</button><span class="muted" style="font-size:11px">只是记录自己的学习，不需要连续打卡</span></div></div>
- <div class="panel"><div class="row-between"><h3>想学的时候就做</h3><span class="tiny-badge purple">没有期限</span></div>${task('练习 '+goal+' 个词条（参考）',categoryLabel+' · 网站自动计数，不用抄写',studied>=goal,'每日')}${task('听 1 段课堂模拟句','可选 · 先听主题和转折',Boolean(state.listenDone[localDate()]?.length),'可选')}${task('写一句自己的理解','可选 · 不强制写课堂笔记',Boolean(state.notes[localDate()]?.trim()),'可选')}<div class="checkin-zone"><button class="btn btn-ghost btn-sm" data-action="goPlan">浏览我的词库 ${IC('arrow')}</button></div></div></div>
+ <div class="columns"><div class="panel"><div class="row-between"><h3>今天的自由背词 · ${esc(categoryLabel)}</h3><button class="btn btn-ghost btn-sm" data-action="goPlan">我的词库 ${IC('arrow')}</button></div><div class="progress-head"><strong>${studied>=goal?'今天的新目标完成啦 ✨':'今天已完成 '+studied+' / '+goal+' 个 · 还剩 '+(goal-studied)+' 个'}</strong><span>${Math.round(100*Math.min(studied/goal,1))}%</span></div><div class="progress-track"><div class="progress-fill" style="width:${Math.min(studied/goal*100,100)}%"></div></div><div class="goal-note">以巴塞罗那时间每天 00:00 为结算点。当天未完成的数量会逾期并顺延；补学优先抵扣最早的逾期任务，不用手抄。</div><div class="section-heading"><h2>我的打卡足迹（可选）</h2><span class="hint">打卡一次就够</span></div>${weeklyMini()}<div class="checkin-zone"><button class="btn ${signed?'btn-soft':'btn-primary'}" data-action="checkin">${IC('check')} ${signed?'今天已打卡':'完成今日打卡'}</button><span class="muted" style="font-size:11px">只是记录自己的学习，不需要连续打卡</span></div></div>
+ <div class="panel"><div class="row-between"><h3>逾期与今日安排</h3><span class="tiny-badge purple">巴塞罗那时间</span></div>${lateCount?`<p class="subtext">累计逾期 <strong>${lateCount}</strong> 个，未完成任务不会消失。</p>${lateList}${late.length>5?`<p class="footnote">另外还有 ${late.length-5} 个日期，可在「我的词库」中查看。</p>`:''}<button class="btn btn-primary full" data-action="goVocab" style="margin:12px 0">先补逾期，再背今日新词</button>`:'<p class="subtext">当前没有逾期任务；今晚 00:00 才会结算今天的未完成词数。</p>'}${task('练习 '+goal+' 个词',categoryLabel+' · 今日新任务',studied>=goal,'今日')}${task('听 1 段课堂模拟句','可选 · 先听主题和转折',Boolean(state.listenDone[localDate()]?.length),'可选')}${task('写一句自己的理解','可选 · 不强制写课堂笔记',Boolean(state.notes[localDate()]?.trim()),'可选')}<div class="checkin-zone"><button class="btn btn-ghost btn-sm" data-action="goPlan">浏览我的词库 ${IC('arrow')}</button></div></div></div>
  <div class="section-heading"><h2>与你的 MAVE 课堂直接相关</h2><span class="hint">从旧知识走向新问题</span></div><div class="lecture-guide"><div class="mini-topic"><div class="tiny-badge">10/05 · 已学</div><div class="title">Diferencia → desigualdad</div><div class="desc">社会怎样把“不同”变成等级与不平等？</div></div><div class="mini-topic"><div class="tiny-badge">10/06 · 已学</div><div class="title">Hablar de / con / por</div><div class="desc">谈论别人、和别人说、替别人说，区别是什么？</div></div><div class="mini-topic"><div class="tiny-badge purple">10/14 · 大纲预习</div><div class="title">Spivak → Ontología</div><div class="desc">谁能被听见？我们怎样理解现实与知识？</div></div></div>
  <div class="section-heading"><h2>今天的一句话</h2></div><div class="quote-panel"><div class="quote-es">«No se trata de entenderlo todo, sino de seguir el hilo.»</div><div class="quote-zh">不必把所有句子都听懂，先跟住讨论的主线。这是为你设计的学习提醒，不是老师原话。</div></div>`}
 function stat(title,value,foot,icon){return `<div class="stat-card"><div class="stat-top"><span>${title}</span>${IC(icon)}</div><div class="stat-value">${esc(value)}</div><div class="stat-foot">${foot}</div></div>`}
 function task(title,desc,done,time){return `<div class="task"><div class="task-mark ${done?'done':''}">${IC(done?'check':'circle')}</div><div><div class="task-title">${title}</div><div class="task-desc">${desc}</div></div><div class="meta">${time}</div></div>`}
 function catSegment(){return `<div class="segment" role="group" aria-label="选择词库">${[['MAVE','MAVE 专业'],['B1','DELE B1'],['B2','DELE B2'],['ALL','全部']].map(([id,name])=>`<button data-action="chooseCat" data-cat="${id}" class="${ui.category===id?'active':''}" aria-pressed="${ui.category===id}">${name}</button>`).join('')}</div>`}
 function renderVocab(){return `<div class="eyebrow">VOCABULARIO · 专属词库</div><h1 class="page-title">背单词工作台</h1><p class="page-desc">先 MAVE，再 DELE B1 / B2。词库不设总词数上限，可持续追加；选“忘记、模糊、记住”安排复习。学习记录只保存在当前浏览器。</p><div class="page-tools">${catSegment()}<div class="selection"><span class="counter">专业词 ${WORDS.filter(w=>w.cat==='MAVE').length} · B1 ${WORDS.filter(w=>w.cat==='B1').length} · B2 ${WORDS.filter(w=>w.cat==='B2').length} · 合计 ${WORDS.length}</span></div></div><div class="tab-row" style="margin-bottom:16px"><button class="tab-btn ${ui.vocabTab==='cards'?'active':''}" data-action="vocabTab" data-tab="cards">${IC('layers')} 单词卡</button><button class="tab-btn ${ui.vocabTab==='quiz'?'active':''}" data-action="vocabTab" data-tab="quiz">${IC('target')} 小测验</button><button class="tab-btn ${ui.vocabTab==='library'?'active':''}" data-action="vocabTab" data-tab="library">${IC('search')} 完整词库</button></div><div id="vocabInner">${ui.vocabTab==='cards'?renderCards():ui.vocabTab==='quiz'?renderQuiz():renderLibrary()}</div>`}
-function scopeBar(){return `<div class="page-tools"><div class="segment" role="group" aria-label="选择练习范围">${[['today','按自选数量'],['smart','智能混合'],['new','未学词'],['due','待复习'],['favorites','收藏'],['all','当前全部']].map(([id,n])=>`<button data-action="chooseScope" data-scope="${id}" class="${ui.scope===id?'active':''}">${n}</button>`).join('')}</div><span class="counter" style="font-size:11px;color:#849289">到期 ${reviewDue()} · 学过 ${Object.keys(state.reviews).length}</span></div>`}
+function scopeBar(){return `<div class="page-tools"><div class="segment" role="group" aria-label="选择练习范围">${[['today','逾期＋今日'],['smart','智能混合'],['new','未学词'],['due','待复习'],['favorites','收藏'],['all','当前全部']].map(([id,n])=>`<button data-action="chooseScope" data-scope="${id}" class="${ui.scope===id?'active':''}">${n}</button>`).join('')}</div><span class="counter" style="font-size:11px;color:#849289">到期 ${reviewDue()} · 学过 ${Object.keys(state.reviews).length}</span></div>`}
 function renderCards(){if(!ui.queue.length) setQueue();const w=currentWord();const count=ui.queue.length;
- return `${scopeBar()}${w?`<div class="flash-layout"><div class="flash-card"><div class="flash-top"><span class="tiny-badge ${w.cat==='B2'?'purple':w.cat==='B1'?'orange':''}">${labelCat(w.cat)}</span><span class="small-meta">${ui.queueAt+1} / ${count} · ${esc(w.topic)}</span><button class="text-action ${state.favorites.includes(w.id)?'fav':''}" data-action="favorite" data-id="${w.id}" title="收藏">${IC('star')}</button></div><div class="flash-center"><div class="flash-word">${esc(w.es)}</div><div class="flash-topic">${esc(w.topic)} · ES → 中文</div><button data-action="speakWord" data-id="${w.id}" class="btn btn-ghost btn-sm" aria-label="朗读西班牙语">${IC('volume')} 听发音</button>${ui.flip?`<div class="flash-answer">${esc(w.zh)}</div><div class="flash-ex">${esc(w.example)}</div><div class="flash-exzh">${esc(w.exampleZh)}</div><button class="btn btn-ghost btn-sm" data-action="speakSentence" data-id="${w.id}" style="margin-top:12px">${IC('volume')} 听例句</button>`:`<div class="flash-placeholder">先回想意思，再点“翻开答案”</div>`}</div><div class="flash-actions">${ui.flip?`<button class="btn btn-warm" data-action="rate" data-grade="0">① 忘记了</button><button class="btn btn-purple" data-action="rate" data-grade="1">② 有点模糊</button><button class="btn btn-primary" data-action="rate" data-grade="2">③ 记住了</button>`:`<button class="btn btn-primary full btn-lg" data-action="flip">${IC('layers')} 翻开答案 <span style="opacity:.65">Space</span></button>`}</div></div><div class="flash-side"><div class="howto"><strong>记忆卡片怎么用？</strong><p class="subtext">看见西语后先想中文，再翻面。你选择的熟悉程度会决定下次复习时间。</p><div class="shortcut"><span>翻开答案</span><kbd>Space</kbd></div><div class="shortcut"><span>忘记 / 模糊 / 记住</span><kbd>1 · 2 · 3</kbd></div><div class="shortcut"><span>下一张卡</span><kbd>自动继续</kbd></div></div><div class="side-tip">${IC('sparkle')} 今天想练 ${state.settings.goal} 个（${esc(planLabel(state.settings.planCategory))}）；数量仅供参考，其他单词也可以自由练。</div><div class="study-meta">今日自选 ${studiedForPlan()} / ${state.settings.goal} · ${esc(planLabel(state.settings.planCategory))}</div></div></div>`:`<div class="empty"><h3>${ui.scope==='today'&&planRemaining()===0?'今天已经练到自己选的数量啦 🌱':ui.queueAt>0?'这轮练习结束了 🌱':'这个范围暂时没有词'}</h3><p>${ui.scope==='today'&&planRemaining()===0?'今天已经练到自己选的数量，可以休息或继续随意背词。':ui.scope==='today'?'这个计划范围内暂时没有更多未练词，可切换范围或调整计划。':ui.scope==='due'?'今天没有到期复习的词。':'可以切换范围，或者重新开始这一组。'}</p>${ui.scope==='today'?'<button class="btn btn-primary" data-action="goPlan">回到我的词库</button>':'<button class="btn btn-primary" data-action="restartCards">重新开始</button>'}<button class="btn btn-ghost" data-action="chooseScope" data-scope="smart">继续自由学习</button></div>`}`}
+ return `${scopeBar()}${w?`<div class="flash-layout"><div class="flash-card"><div class="flash-top"><span class="tiny-badge ${w.cat==='B2'?'purple':w.cat==='B1'?'orange':''}">${labelCat(w.cat)}</span><span class="small-meta">${ui.queueAt+1} / ${count} · ${esc(w.topic)}</span><button class="text-action ${state.favorites.includes(w.id)?'fav':''}" data-action="favorite" data-id="${w.id}" title="收藏">${IC('star')}</button></div><div class="flash-center"><div class="flash-word">${esc(w.es)}</div><div class="flash-topic">${esc(w.topic)} · ES → 中文</div><button data-action="speakWord" data-id="${w.id}" class="btn btn-ghost btn-sm" aria-label="朗读西班牙语">${IC('volume')} 听发音</button>${ui.flip?`<div class="flash-answer">${esc(w.zh)}</div><div class="flash-ex">${esc(w.example)}</div><div class="flash-exzh">${esc(w.exampleZh)}</div><button class="btn btn-ghost btn-sm" data-action="speakSentence" data-id="${w.id}" style="margin-top:12px">${IC('volume')} 听例句</button>`:`<div class="flash-placeholder">先回想意思，再点“翻开答案”</div>`}</div><div class="flash-actions">${ui.flip?`<button class="btn btn-warm" data-action="rate" data-grade="0">① 忘记了</button><button class="btn btn-purple" data-action="rate" data-grade="1">② 有点模糊</button><button class="btn btn-primary" data-action="rate" data-grade="2">③ 记住了</button>`:`<button class="btn btn-primary full btn-lg" data-action="flip">${IC('layers')} 翻开答案 <span style="opacity:.65">Space</span></button>`}</div></div><div class="flash-side"><div class="howto"><strong>记忆卡片怎么用？</strong><p class="subtext">看见西语后先想中文，再翻面。你选择的熟悉程度会决定下次复习时间。</p><div class="shortcut"><span>翻开答案</span><kbd>Space</kbd></div><div class="shortcut"><span>忘记 / 模糊 / 记住</span><kbd>1 · 2 · 3</kbd></div><div class="shortcut"><span>下一张卡</span><kbd>自动继续</kbd></div></div><div class="side-tip">${IC('sparkle')} 巴塞罗那时间 00:00 自动结算；逾期背词会排在当日新词之前。也可以自由学习其他词。</div><div class="study-meta">今日新词 ${studiedForPlan()} / ${todayTaskStatus().goal} · 历史逾期 ${overdueRemaining()} 个</div></div></div>`:`<div class="empty"><h3>${ui.scope==='today'&&planRemaining()===0?'逾期和今日的背词任务都完成啦 🌱':ui.queueAt>0?'这轮练习结束了 🌱':'这个范围暂时没有词'}</h3><p>${ui.scope==='today'&&planRemaining()===0?'所有逾期和今日任务已完成，可以休息或继续自由背词。':ui.scope==='today'?'暂时没有更多当天可练的词；未完成的逾期任务会保留，可切换自由学习或下次继续。':ui.scope==='due'?'今天没有到期复习的词。':'可以切换范围，或者重新开始这一组。'}</p>${ui.scope==='today'?'<button class="btn btn-primary" data-action="goPlan">回到我的词库</button>':'<button class="btn btn-primary" data-action="restartCards">重新开始</button>'}<button class="btn btn-ghost" data-action="chooseScope" data-scope="smart">继续自由学习</button></div>`}`}
 function renderQuiz(){const total=ui.quizQueue.length;const w=ui.quizQueue[ui.quizAt];if(!total)return `<div class="panel" style="max-width:730px;margin:auto"><h3>10题迷你测验</h3><p class="subtext">现在选择 ${ui.category==='ALL'?'全部词库':labelCat(ui.category)}。做错的词会自动安排后续复习。答题记录计入今日学习量。</p><div class="tab-row" style="margin:18px 0">${[['multiple','西语 → 中文 · 选择'],['typing','中文 → 西语 · 拼写']].map(([id,n])=>`<button class="tab-btn ${ui.quizMode===id?'active':''}" data-action="quizMode" data-mode="${id}">${n}</button>`).join('')}</div><button class="btn btn-primary btn-lg" data-action="startQuiz">开始10题练习 ${IC('arrow')}</button></div>`;
  if(ui.quizAt>=total)return `<div class="quiz-card" style="text-align:center"><div style="font-size:39px">🌱</div><div class="eyebrow">SESIÓN TERMINADA</div><h2>这一轮完成了</h2><div class="stat-value" style="color:var(--green);margin:16px 0">${ui.quizScore} / ${total}</div><p class="subtext">错题已经加入复习计划。分数只用于定位需要再看的词。</p><button class="btn btn-primary" data-action="startQuiz">再来一轮</button><button class="btn btn-ghost" data-action="vocabTab" data-tab="cards">回到单词卡</button></div>`;
  const answered=ui.quizAnswer!==null;return `<div class="quiz-card"><div class="quiz-counter"><span>${esc(labelCat(w.cat))} · ${ui.quizMode==='multiple'?'选择正确中文':'输入西语表达'}</span><b>${ui.quizAt+1} / ${total}</b></div><div class="progress-track" style="margin-top:12px;height:7px"><div class="progress-fill" style="width:${(ui.quizAt/total)*100}%"></div></div><div class="quiz-question">${esc(ui.quizMode==='multiple'?w.es:w.zh)}</div><div class="quiz-instruction">${ui.quizMode==='multiple'?'下面哪一项最接近这句西班牙语的意思？':'请尽量写出完整的西语词语或表达（会忽略重音差异）。'}</div>${ui.quizMode==='multiple'?ui.quizOptions[ui.quizAt].map(x=>`<button class="quiz-opt ${answered&&x===w.zh?'correct':''} ${answered&&x===ui.quizAnswer.value&&!ui.quizAnswer.correct?'wrong':''}" data-action="answerQuiz" data-choice="${esc(x)}" ${answered?'disabled':''}>${esc(x)}</button>`).join(''):`<input id="quizTyped" class="input-quiz" placeholder="输入答案..." autocomplete="off" autocapitalize="none" ${answered?'disabled':''} value="${esc(ui.quizTyped)}"/><div style="margin-top:12px"><button class="btn btn-primary" data-action="checkTyped" ${answered?'disabled':''}>核对答案</button></div>`}${answered?`<div class="quiz-feedback"><b>${ui.quizAnswer.correct?'答对了！':'可以再记一次：'}</b> ${esc(w.es)} — ${esc(w.zh)}<div style="margin-top:5px">${esc(w.example)}</div></div><button class="btn btn-primary full" style="margin-top:18px" data-action="nextQuiz">下一题 ${IC('arrow')}</button>`:''}</div>`}
@@ -150,31 +206,35 @@ function renderLibrary(){return `<div class="page-tools"><div class="library-sea
 function renderListen(){const l=LISTEN[ui.listenIndex],count=(state.listenDone[localDate()]||[]).length;return `<div class="eyebrow">ESCUCHAR · 学术听力热身</div><h1 class="page-title">先听关键词，再听整句话</h1><p class="page-desc">${LISTEN.length}句与你的课程直接相关的<strong>教学模拟句</strong>（不是老师录音）。点击播放后先抓住两个词，再看西语和中文。</p><div class="listening-layout"><div class="listening-main"><div class="row-between"><span class="tiny-badge purple">${esc(l.topic)}</span><span class="small-meta">${ui.listenIndex+1} / ${LISTEN.length}</span></div><button class="listen-play" data-action="playListen" title="播放西语">${IC('headphones')}</button><div style="text-align:center;color:#8da09a;font-size:12px;margin-bottom:12px">点击耳机，听一遍。想更慢可以按下面的按钮。</div><div class="tab-row" style="justify-content:center;margin:10px 0 22px"><button class="btn btn-white btn-sm" data-action="playListen">${IC('volume')} 正常语速</button><button class="btn btn-white btn-sm" data-action="playListenSlow">${IC('volume')} 慢一点</button></div>${ui.listenText?`<div class="listen-sentence">${esc(l.t)}</div>`:`<div class="listen-hidden">先不看字幕，尝试听出句子的关键词</div>`}<div class="tab-row" style="justify-content:center;margin:14px 0"><button class="btn btn-ghost btn-sm" data-action="toggleListenText">${ui.listenText?'隐藏西语':'显示西语字幕'}</button><button class="btn btn-ghost btn-sm" data-action="toggleListenZh">${ui.listenReveal?'隐藏翻译':'显示中文意思'}</button></div>${ui.listenReveal?`<div class="listen-translation">${esc(l.zh)}</div><div class="listen-keywords">${l.part.map(p=>`<span class="keychip">${esc(p)}</span>`).join('')}</div>`:''}<div class="listen-q">如果第一次听不懂，可以重复三遍。语音来自设备自带的西语朗读引擎。</div><div class="tab-row" style="margin-top:22px"><button class="btn btn-primary" data-action="finishListen">${IC('check')} 已练这一句 · 下一句</button><span class="muted" style="font-size:11px">今天已完成 ${count} 句</span></div></div><div class="listen-list"><div class="row-between"><h3>练习句列表</h3><span class="tiny-badge">${LISTEN.length}句</span></div>${LISTEN.map((it,i)=>`<button class="listen-list-item ${i===ui.listenIndex?'active':''}" data-action="chooseListen" data-i="${i}"><span class="listen-n">${String(i+1).padStart(2,'0')}</span><span><div class="main">${esc(it.topic)}</div><div class="meta">${state.listenDone[localDate()]?.includes(i)?'✓ 今天练过':'点击进入练习'}</div></span></button>`).join('')}</div></div>`}
 function renderConcepts(){return `<div class="eyebrow">MAPA DE CONCEPTOS · 概念地图</div><h1 class="page-title">先知道老师究竟在讨论什么</h1><p class="page-desc">从10月5、6日真实课堂笔记，到10月14日大纲预习。区分“已讨论过”与“预计会讲”，不把模拟问题当作老师原话。</p><div class="concept-grid">${CONCEPTS.map((x,i)=>`<div class="concept-card"><div class="row-between"><span class="tiny-badge ${x.tag.includes('预习')?'purple':''}">${esc(x.tag)}</span><span class="small-meta">0${i+1}</span></div><h3>${esc(x.es)}</h3><div class="ch">${esc(x.zh)}</div><p>${esc(x.what)}</p><p><b>用人话说：</b>${esc(x.simple)}</p><div class="question"><b>${esc(x.q)}</b><div style="margin-top:5px;color:#899f92">${esc(x.qzh)}</div></div><div class="source">材料依据：${esc(x.origin)}</div></div>`).join('')}</div><div class="panel" style="margin-top:16px"><h3>把之前的课程连起来，只要记住一条线</h3><div style="font-size:13px;color:#5d7868;line-height:2.1">差异如何形成 <b>→</b> 谁的标准被当作普遍标准 <b>→</b> 谁代表谁发言 <b>→</b> 谁能够真正被听见 <b>→</b> 我们如何获得知识。</div><p class="footnote">这是复习用的简化逻辑，不是课堂的唯一理论解释。</p></div>`}
 function renderPlan(){
- const today=localDate(),note=state.notes[today]||'',goal=state.settings.goal,category=state.settings.planCategory,studied=studiedForPlan();
+ const today=localDate(),note=state.notes[today]||'',todayTask=todayTaskStatus(),goal=todayTask.goal,category=todayTask.category,studied=todayTask.done,late=overdueTasks(),lateCount=overdueRemaining();
  const choices=[['MAVE','MAVE 专业词','艺术教育硕士课程术语与课堂表达'],['B1','DELE B1','日常西语与实用表达'],['B2','DELE B2','更深入的课堂与学术表达'],['ALL','全部词汇','把现有词条放在一起搜索']];
  const banks=choices.map(([id,name,desc])=>{
   const count=id==='ALL'?WORDS.length:WORDS.filter(w=>w.cat===id).length;
   return `<div class="task"><div class="task-mark">${IC('book')}</div><div style="flex:1;min-width:0"><div class="task-title">${name} · ${count} 条</div><div class="task-desc">${desc}</div></div><button class="btn btn-ghost btn-sm" data-action="openLibrary" data-cat="${id}">打开 ${IC('arrow')}</button></div>`;
  }).join('');
  return `<div class="eyebrow">MI VOCABULARIO · MAVE + DELE</div><h1 class="page-title">我的专属西语词库</h1>
- <p class="page-desc">这里没有时间期限，也没有必须完成的阶段任务。MAVE 艺术教育硕士专业词汇继续保留，同时收藏 DELE B1/B2 实用表达；你随时决定想学哪一组，学多少。</p>
+ <p class="page-desc">这是你的 MAVE 与 DELE 个人词库，没有固定周数。你可随时选词库和每天的数量；未完成的自选背词任务会在巴塞罗那时间 00:00 逾期并顺延。</p>
  <div class="plan-layout">
   <div class="panel">
    <div class="row-between"><h3>我的词库</h3><span class="tiny-badge">${WORDS.length} 个词条 · 持续扩充</span></div>
    <p class="subtext">直接打开词库搜索、收藏和复习，以后增加的新词也会继续归入这里，不用手抄。</p>
    ${banks}
+   <div class="divider"></div><div class="row-between"><h3>逾期背词清单</h3><span class="tiny-badge orange">${lateCount} 个未完成</span></div>
+   <p class="subtext">巴塞罗那当地时间每天 00:00 结算。过了午夜，没完成的目标自动逾期并延续到第二天；补学时优先抵扣最早的任务。</p>
+   ${late.length?late.map(t=>`<div class="task"><div class="task-mark">${IC('refresh')}</div><div><div class="task-title">${esc(t.date)} · ${esc(planLabel(t.category))}</div><div class="task-desc">原定 ${t.goal} · 已完成 ${t.done} · 待补 ${t.remaining} 个</div></div><span class="tiny-badge orange">已逾期</span></div>`).join(''):'<p class="subtext">目前没有逾期背词任务。</p>'}
+   ${lateCount?'<button class="btn btn-primary full" data-action="goVocab" style="margin-top:12px">开始补逾期背词</button>':''}
    <div class="checkin-zone"><button class="btn btn-soft" data-action="openFavorites">${IC('star')} 我收藏的单词</button><button class="btn btn-ghost" data-action="goListen">${IC('headphones')} 西语听力</button></div>
-   <p class="footnote">MAVE、B1、B2 和原有学习记录都会保留，不需要追赶任何进度。</p>
+   <p class="footnote">MAVE、B1、B2 和原有学习记录都会保留，未完成的自选词数会自动转为逾期。</p>
   </div>
   <div>
    <div class="panel">
     <div class="row-between"><h3>今天学多少，自己决定</h3><span class="tiny-badge">没有硬性要求</span></div>
-    <p class="subtext">数字只是你给自己的参考目标，没完成也不会累积到明天。</p>
+    <p class="subtext">每天自选词数在巴塞罗那时间凌晨 00:00 结算，未完成的数量进入逾期清单，并在以后优先补学。</p>
     <div class="field"><label for="planGoal">想每天练习的词条数量</label><input id="planGoal" type="number" min="1" step="1" inputmode="numeric" value="${goal}"><small>至少 1 个，无固定上限。数量随时可以修改。</small></div>
     <div class="tab-row" style="margin:10px 0 15px;flex-wrap:wrap">${[5,10,15,20,30,50].map(n=>`<button class="btn btn-white btn-sm" data-action="planPreset" data-count="${n}">${n} 个</button>`).join('')}</div>
     <div class="field"><label for="planCategory">选择想学的词库</label><select id="planCategory"><option value="ALL" ${category==='ALL'?'selected':''}>全部（MAVE + DELE B1/B2）</option><option value="MAVE" ${category==='MAVE'?'selected':''}>MAVE 专业词</option><option value="B1" ${category==='B1'?'selected':''}>DELE B1</option><option value="B2" ${category==='B2'?'selected':''}>DELE B2</option></select></div>
     <button class="btn btn-primary full" data-action="savePlan">保存我的选择并返回首页</button>
-    <div class="goal-note">今天已练习 <strong>${studied} / ${goal}</strong> 个 · ${esc(planLabel(category))}。背词时点击“忘记、模糊、记住”，网站自动记录。${goal>WORDS.filter(w=>category==='ALL'||w.cat===category).length?' 当前所选词库小于参考目标，可以选择其他词库或稍后增加词条。':''}</div>
+    <div class="goal-note">今日新任务 <strong>${studied} / ${goal}</strong> 个 · ${esc(planLabel(category))}。历史逾期待补 ${lateCount} 个，补学优先抵扣旧任务。选择“忘记、模糊、记住”即可记录。${goal>WORDS.filter(w=>category==='ALL'||w.cat===category).length?' 当前所选词库小于参考目标，可以选择其他词库或稍后增加词条。':''}</div>
     <button class="btn btn-soft full" data-action="goVocab" style="margin-top:12px">直接开始背词</button>
    </div>
    <div class="panel" style="margin-top:15px"><h3>课堂随手记（可选）</h3>
@@ -185,14 +245,14 @@ function renderPlan(){
   </div>
  </div>`;
 }
-function render(){document.querySelector('.nav-dot').textContent=WORDS.length;const names={home:'学习首页',vocab:'背单词',listen:'听力热身',concepts:'概念地图',plan:'我的词库'};document.getElementById('locationTitle').textContent=names[ui.view];document.getElementById('dateNow').textContent=fmtDate();document.getElementById('mainContent').innerHTML=({home:renderHome,vocab:renderVocab,listen:renderListen,concepts:renderConcepts,plan:renderPlan})[ui.view]();document.querySelectorAll('[data-nav]').forEach(b=>{b.classList.toggle('active',b.dataset.nav===ui.view);if(b.dataset.nav===ui.view)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});document.getElementById('settingsModal').classList.toggle('hidden',!ui.settingsOpen);if(ui.settingsOpen)document.getElementById('goalInput').value=state.settings.goal}
+function render(){ensureDailyTasks();renderedMadridDate=localDate();document.querySelector('.nav-dot').textContent=WORDS.length;const names={home:'学习首页',vocab:'背单词',listen:'听力热身',concepts:'概念地图',plan:'我的词库'};document.getElementById('locationTitle').textContent=names[ui.view];document.getElementById('dateNow').textContent=fmtDate();document.getElementById('mainContent').innerHTML=({home:renderHome,vocab:renderVocab,listen:renderListen,concepts:renderConcepts,plan:renderPlan})[ui.view]();document.querySelectorAll('[data-nav]').forEach(b=>{b.classList.toggle('active',b.dataset.nav===ui.view);if(b.dataset.nav===ui.view)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});document.getElementById('settingsModal').classList.toggle('hidden',!ui.settingsOpen);if(ui.settingsOpen)document.getElementById('goalInput').value=state.settings.goal}
 function openSettings(){ui.settingsOpen=true;render()}
 function exportBackup(){const blob=new Blob([JSON.stringify({format:'mave-atlas-backup-v1',savedAt:new Date().toISOString(),data:state},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='MAVE_学习进度备份_'+localDate()+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),3000);toast('进度备份已开始下载。')}
 function importBackup(file){if(!file)return;file.text().then(t=>{let parsed=JSON.parse(t);if(parsed.format!=='mave-atlas-backup-v1'||!parsed.data||typeof parsed.data!=='object')throw Error('不是本网站的备份文件');if(!confirm('导入将覆盖这个浏览器现有的学习记录，确定继续吗？'))return;state=normalize(parsed.data);save();ui.settingsOpen=false;ui.queue=[];ui.quizQueue=[];render();toast('学习进度已从备份恢复。')}).catch(()=>toast('无法读取备份，请选择本站导出的 JSON 文件。'))}
 function onClick(e){const b=e.target.closest('[data-action],[data-nav]');if(!b)return;
  if(b.dataset.nav){nav(b.dataset.nav);return}
  const a=b.dataset.action;
- if(a==='goVocab'){ui.vocabTab='cards';ui.category=state.settings.planCategory;ui.scope='today';setQueue();nav('vocab')}
+ if(a==='goVocab'){ui.vocabTab='cards';ui.category='ALL';ui.scope='today';setQueue();nav('vocab')}
  else if(a==='openLibrary'){ui.vocabTab='library';ui.category=b.dataset.cat;ui.wordSearch='';ui.queue=[];ui.quizQueue=[];nav('vocab')}
  else if(a==='openFavorites'){ui.vocabTab='cards';ui.category='ALL';ui.scope='favorites';setQueue();nav('vocab')}
  else if(a==='goListen')nav('listen');
@@ -201,7 +261,7 @@ function onClick(e){const b=e.target.closest('[data-action],[data-nav]');if(!b)r
  else if(a==='settings')openSettings();
  else if(a==='closeSettings'){ui.settingsOpen=false;render()}
  else if(a==='chooseCat'){ui.category=b.dataset.cat;if(ui.scope==='today'&&ui.category!==state.settings.planCategory)ui.scope='smart';ui.queue=[];ui.quizQueue=[];ui.quizAt=0;ui.flip=false;render()}
- else if(a==='chooseScope'){ui.scope=b.dataset.scope;if(ui.scope==='today')ui.category=state.settings.planCategory;setQueue();render()}
+ else if(a==='chooseScope'){ui.scope=b.dataset.scope;if(ui.scope==='today')ui.category='ALL';setQueue();render()}
  else if(a==='vocabTab'){ui.vocabTab=b.dataset.tab;if(ui.vocabTab==='cards'&&!ui.queue.length)setQueue();render()}
  else if(a==='flip'){ui.flip=true;render()}
  else if(a==='rate'){const w=currentWord();if(w){rateWord(w,Number(b.dataset.grade));ui.queueAt++;ui.flip=false;render();if(ui.queueAt>=ui.queue.length)toast('本轮练习完成！')}}
@@ -221,8 +281,8 @@ function onClick(e){const b=e.target.closest('[data-action],[data-nav]');if(!b)r
  else if(a==='toggleListenZh'){ui.listenReveal=!ui.listenReveal;render()}
  else if(a==='finishListen'){let today=localDate();state.listenDone[today] ||= [];if(!state.listenDone[today].includes(ui.listenIndex))state.listenDone[today].push(ui.listenIndex);save();ui.listenIndex=(ui.listenIndex+1)%LISTEN.length;ui.listenText=false;ui.listenReveal=false;render();toast('听力练习已记录。')}
  else if(a==='planPreset'){const input=document.getElementById('planGoal');if(input)input.value=b.dataset.count}
- else if(a==='savePlan'){const value=document.getElementById('planGoal')?.value;const category=document.getElementById('planCategory')?.value;if(!validDailyGoal(value)){toast('请输入至少为 1 的整数，例如 5、15 或 40。');return}if(!['MAVE','B1','B2','ALL'].includes(category)){toast('请选择有效的学习范围。');return}state.settings.goal=Number(value);state.settings.planCategory=category;if(!save())return;ui.queue=[];ui.quizQueue=[];nav('home');toast('词库偏好已保存，首页已经同步。')}
- else if(a==='saveGoal'){const value=document.getElementById('goalInput')?.value;if(!validDailyGoal(value)){toast('请输入至少为 1 的整数。');return}state.settings.goal=Number(value);if(!save())return;ui.queue=[];ui.settingsOpen=false;render();toast('参考目标已更新，也同步到了我的词库。')}
+ else if(a==='savePlan'){const value=document.getElementById('planGoal')?.value;const category=document.getElementById('planCategory')?.value;if(!validDailyGoal(value)){toast('请输入至少为 1 的整数，例如 5、15 或 40。');return}if(!['MAVE','B1','B2','ALL'].includes(category)){toast('请选择有效的学习范围。');return}ensureDailyTasks();state.settings.goal=Number(value);state.settings.planCategory=category;state.dailyTasks[localDate()]={goal:Number(value),category};if(!save())return;ui.queue=[];ui.quizQueue=[];nav('home');toast('今日任务已更新；之前逾期的任务仍然保留。')}
+ else if(a==='saveGoal'){const value=document.getElementById('goalInput')?.value;if(!validDailyGoal(value)){toast('请输入至少为 1 的整数。');return}ensureDailyTasks();state.settings.goal=Number(value);state.dailyTasks[localDate()]={goal:Number(value),category:state.settings.planCategory};if(!save())return;ui.queue=[];ui.settingsOpen=false;render();toast('今日任务已更新；旧逾期数量不变。')}
  else if(a==='export')exportBackup();
  else if(a==='import')document.getElementById('backupFile').click();
  else if(a==='reset'){if(confirm('确定清空这个浏览器里的所有打卡、背词、笔记吗？此操作不能撤销，建议先导出备份。')){state=normalize({});save();ui.queue=[];ui.quizQueue=[];ui.settingsOpen=false;render();toast('本地记录已清空。')}}
@@ -238,5 +298,6 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&ui.settingsOpen){ui
  }});
 document.getElementById('settingsModal').addEventListener('click',e=>{if(e.target.id==='settingsModal'){ui.settingsOpen=false;render()}});
 render();
+setInterval(()=>{const day=localDate();if(day!==renderedMadridDate){renderedMadridDate=day;ui.queue=[];ui.quizQueue=[];ui.queueAt=0;render()}},1000);
 </script>
 </body></html>
