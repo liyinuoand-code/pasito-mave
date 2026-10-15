@@ -126,11 +126,12 @@ function normalize(s){
   if(/^\d{4}-\d{2}-\d{2}$/.test(date)&&task&&validDailyGoal(task.goal)&&['MAVE','B1','B2','ALL'].includes(task.category))dailyTasks[date]={goal:Number(task.goal),category:task.category};
  }
  const reviewLogs={};for(const [date,v] of Object.entries(s.reviewLogs&&typeof s.reviewLogs==='object'&&!Array.isArray(s.reviewLogs)?s.reviewLogs:{})){if(/^\d{4}-\d{2}-\d{2}$/.test(date)&&v&&Array.isArray(v.ids))reviewLogs[date]={ids:[...new Set(v.ids.filter(id=>typeof id==='string'))]}}
- return {checkins:Array.isArray(s.checkins)?s.checkins:[],reviews:s.reviews&&typeof s.reviews==='object'?s.reviews:{},logs:s.logs&&typeof s.logs==='object'?s.logs:{},reviewLogs,notes:s.notes&&typeof s.notes==='object'?s.notes:{},favorites:Array.isArray(s.favorites)?s.favorites:[],listenDone:s.listenDone&&typeof s.listenDone==='object'?s.listenDone:{},settings:{goal:validDailyGoal(s.settings?.goal)?Number(s.settings.goal):10,planCategory:['MAVE','B1','B2','ALL'].includes(s.settings?.planCategory)?s.settings.planCategory:'ALL',quizCount:validDailyGoal(s.settings?.quizCount)?Number(s.settings.quizCount):10},dailyTasks};
+ const reviewPlans={};for(const [date,v] of Object.entries(s.reviewPlans&&typeof s.reviewPlans==='object'&&!Array.isArray(s.reviewPlans)?s.reviewPlans:{})){if(/^\d{4}-\d{2}-\d{2}$/.test(date)&&v&&Array.isArray(v.ids))reviewPlans[date]={ids:[...new Set(v.ids.filter(id=>typeof id==='string'))].slice(0,20)}}
+ return {checkins:Array.isArray(s.checkins)?s.checkins:[],reviews:s.reviews&&typeof s.reviews==='object'?s.reviews:{},logs:s.logs&&typeof s.logs==='object'?s.logs:{},reviewLogs,reviewPlans,notes:s.notes&&typeof s.notes==='object'?s.notes:{},favorites:Array.isArray(s.favorites)?s.favorites:[],listenDone:s.listenDone&&typeof s.listenDone==='object'?s.listenDone:{},settings:{goal:validDailyGoal(s.settings?.goal)?Number(s.settings.goal):10,planCategory:['MAVE','B1','B2','ALL'].includes(s.settings?.planCategory)?s.settings.planCategory:'ALL',quizCount:validDailyGoal(s.settings?.quizCount)?Number(s.settings.quizCount):10},dailyTasks};
 }
 let state=load();
 let taskStatusCache=null;
-let ui={view:'home',vocabTab:'cards',category:'ALL',scope:'today',queue:[],queueAt:0,flip:false,wordSearch:'',wordListCategory:'ALL',quizMode:'multiple',quizQueue:[],quizAt:0,quizOptions:[],quizAnswer:null,quizTyped:'',quizScore:0,listenIndex:0,listenReveal:false,listenText:false,settingsOpen:false,conceptSearch:'',conceptDate:'ALL',conceptSource:'ALL',conceptCourse:'ALL'};
+let ui={view:'home',vocabTab:'cards',category:'ALL',scope:'daily',dailyStage:'review',queue:[],queueAt:0,flip:false,wordSearch:'',wordListCategory:'ALL',quizMode:'multiple',quizQueue:[],quizAt:0,quizOptions:[],quizAnswer:null,quizTyped:'',quizScore:0,listenIndex:0,listenReveal:false,listenText:false,settingsOpen:false,conceptSearch:'',conceptDate:'ALL',conceptSource:'ALL',conceptCourse:'ALL'};
 let toastTimer;
 let renderedMadridDate=localDate();
 function save(){taskStatusCache=null;try{localStorage.setItem(STORE,JSON.stringify(state));return true}catch(e){toast('浏览器未能保存进度，请用设置中的“导出备份”保存。');return false}}
@@ -195,12 +196,69 @@ function reviewCandidates(){
  return [...y,...previous];
 }
 function previousDayCount(){return new Set((state.logs[dayPlus(localDate(),-1)]?.ids||[]).filter(id=>WORDS.some(w=>w.id===id))).size}
+
+function historicalLearnedIds(){
+ const today=localDate(),ids=new Set(),valid=new Set(WORDS.map(w=>w.id));
+ for(const [date,log] of Object.entries(state.logs))if(date<today)for(const id of log?.ids||[])if(valid.has(id))ids.add(id);
+ for(const [date,log] of Object.entries(state.reviewLogs))if(date<=today)for(const id of log?.ids||[])if(valid.has(id))ids.add(id);
+ for(const [id,review] of Object.entries(state.reviews)){
+  if(!valid.has(id))continue;
+  if(review?.firstLearned&&review.firstLearned<today)ids.add(id);
+  else if(!review?.firstLearned&&review?.last&&review.last<today)ids.add(id);
+ }
+ return [...ids];
+}
+function dailyReviewProgress(){
+ const learned=historicalLearnedIds(),seen=new Set(learned),finished=reviewedTodayIds().filter(id=>seen.has(id));
+ const goal=state.reviewPlans[localDate()]?.ids.length??Math.min(20,learned.length);
+ return {learned:learned.length,reviewed:finished.length,pending:Math.max(0,learned.length-finished.length),warmupGoal:goal,warmupDone:Math.min(goal,finished.length)};
+}
+function rotatingReviewCandidates(){
+ const today=localDate(),pool=historicalLearnedIds(),done=new Set(reviewedTodayIds()),counts=new Map(),last=new Map(),yesterday=new Set(state.logs[dayPlus(today,-1)]?.ids||[]);
+ for(const [date,entry] of Object.entries(state.reviewLogs)){
+  if(date>today)continue;
+  for(const id of new Set(entry?.ids||[])){counts.set(id,(counts.get(id)||0)+1);if(date>(last.get(id)||''))last.set(id,date)}
+ }
+ return shuffle(pool.filter(id=>!done.has(id))).sort((a,b)=>{
+  const diff=(counts.get(a)||0)-(counts.get(b)||0);if(diff)return diff;
+  const recent=(last.get(a)||'').localeCompare(last.get(b)||'');if(recent)return recent;
+  return Number(yesterday.has(b))-Number(yesterday.has(a));
+ });
+}
+function ensureDailyReviewPlan(){
+ const day=localDate();
+ if(state.reviewPlans[day])return state.reviewPlans[day].ids;
+ const learned=new Set(historicalLearnedIds()),already=reviewedTodayIds().filter(id=>learned.has(id));
+ const picked=[...new Set(already)].slice(0,20),want=Math.max(0,20-picked.length);
+ const ids=[...picked,...rotatingReviewCandidates().filter(id=>!picked.includes(id)).slice(0,want)];
+ state.reviewPlans[day]={ids};save();
+ return ids;
+}
+function setDailyQueue(){
+ ui.category='ALL';
+ const all=ensureDailyReviewPlan(),finished=new Set(reviewedTodayIds()),pending=all.filter(id=>!finished.has(id));
+ ui.dailyStage=pending.length?'review':'new';
+ ui.queue=pending.length?pending:plannedVocabularyQueue();
+ ui.queueAt=0;ui.flip=false;
+}
+function finishStudyCard(grade){
+ const w=currentWord();if(!w)return;
+ const wasReview=ui.scope==='yesterday'||(ui.scope==='daily'&&ui.dailyStage==='review');
+ rateWord(w,grade,wasReview?'review':'learn');
+ ui.queueAt++;ui.flip=false;
+ if(ui.scope==='daily'&&ui.dailyStage==='review'&&ui.queueAt>=ui.queue.length){
+  ui.dailyStage='new';ui.queue=plannedVocabularyQueue();ui.queueAt=0;
+  render();toast('旧词复习完成！已自动进入今天的新词 🌷');return;
+ }
+ render();
+ if(ui.queueAt>=ui.queue.length)toast(ui.scope==='daily'?'今天的学习流程完成啦 🌷':'本轮练习完成！');
+}
 function rateWord(w,grade,mode='learn'){
  const wasNew=!state.reviews[w.id],prev=state.reviews[w.id]||{reps:0,interval:0,ease:2.3};
  let reps=grade===0?0:(prev.reps||0)+1;
  let ease=clamp((prev.ease||2.3)+(grade===2?.13:grade===1?-.08:-.24),1.35,2.9);
  let interval=grade===0?1:grade===1?(prev.interval?Math.max(1,Math.ceil(prev.interval*.75)):1):(prev.reps===0?3:Math.max(2,Math.round(prev.interval*ease)));
- state.reviews[w.id]={reps,ease,interval,due:dayPlus(localDate(),interval),last:localDate(),grade};
+ state.reviews[w.id]={...prev,reps,ease,interval,due:dayPlus(localDate(),interval),last:localDate(),grade,firstLearned:prev.firstLearned||(!wasNew?(prev.last||localDate()):localDate())};
  if(mode==='review')markReview(w);else if(wasNew)recordStudy(w,grade>0);else save();
 }
 function checkIn(){const d=localDate();if(!state.checkins.includes(d)){state.checkins.push(d);state.checkins.sort();save();toast('今日打卡成功。谢谢你为自己留出学习时间 🌿')}else toast('今天已经打卡啦。明天再来就好。');render()}
@@ -209,6 +267,7 @@ function labelCat(cat){return cat==='MAVE'?'MAVE 专业':'DELE '+cat}
 function nav(v){ui.view=v;render();window.scrollTo({top:0,behavior:'auto'})}
 function setQueue(){
  const today=localDate();
+ if(ui.scope==='daily'){setDailyQueue();return}
  if(ui.scope==='today'){ui.category='ALL';ui.queue=plannedVocabularyQueue();ui.queueAt=0;ui.flip=false;return}
  if(ui.scope==='yesterday'){ui.category='ALL';ui.queue=reviewCandidates().slice(0,20);ui.queueAt=0;ui.flip=false;return}
  let pool=WORDS.filter(w=>ui.category==='ALL'||w.cat===ui.category);
