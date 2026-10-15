@@ -76,7 +76,8 @@ function normalize(s){
  for(const [date,task] of Object.entries(raw)){
   if(/^\d{4}-\d{2}-\d{2}$/.test(date)&&task&&validDailyGoal(task.goal)&&['MAVE','B1','B2','ALL'].includes(task.category))dailyTasks[date]={goal:Number(task.goal),category:task.category};
  }
- return {checkins:Array.isArray(s.checkins)?s.checkins:[],reviews:s.reviews&&typeof s.reviews==='object'?s.reviews:{},logs:s.logs&&typeof s.logs==='object'?s.logs:{},notes:s.notes&&typeof s.notes==='object'?s.notes:{},favorites:Array.isArray(s.favorites)?s.favorites:[],listenDone:s.listenDone&&typeof s.listenDone==='object'?s.listenDone:{},settings:{goal:validDailyGoal(s.settings?.goal)?Number(s.settings.goal):10,planCategory:['MAVE','B1','B2','ALL'].includes(s.settings?.planCategory)?s.settings.planCategory:'ALL'},dailyTasks};
+ const reviewLogs={};for(const [date,v] of Object.entries(s.reviewLogs&&typeof s.reviewLogs==='object'&&!Array.isArray(s.reviewLogs)?s.reviewLogs:{})){if(/^\d{4}-\d{2}-\d{2}$/.test(date)&&v&&Array.isArray(v.ids))reviewLogs[date]={ids:[...new Set(v.ids.filter(id=>typeof id==='string'))]}}
+ return {checkins:Array.isArray(s.checkins)?s.checkins:[],reviews:s.reviews&&typeof s.reviews==='object'?s.reviews:{},logs:s.logs&&typeof s.logs==='object'?s.logs:{},reviewLogs,notes:s.notes&&typeof s.notes==='object'?s.notes:{},favorites:Array.isArray(s.favorites)?s.favorites:[],listenDone:s.listenDone&&typeof s.listenDone==='object'?s.listenDone:{},settings:{goal:validDailyGoal(s.settings?.goal)?Number(s.settings.goal):10,planCategory:['MAVE','B1','B2','ALL'].includes(s.settings?.planCategory)?s.settings.planCategory:'ALL',quizCount:validDailyGoal(s.settings?.quizCount)?Number(s.settings.quizCount):10},dailyTasks};
 }
 let state=load();
 let taskStatusCache=null;
@@ -124,13 +125,10 @@ function overdueTasks(){return taskStatuses().filter(t=>t.overdue)}
 function overdueRemaining(){return overdueTasks().reduce((sum,t)=>sum+t.remaining,0)}
 function planRemaining(){return taskStatuses().reduce((sum,t)=>sum+t.remaining,0)}
 function plannedVocabularyQueue(){
- const used=new Set(state.logs[localDate()]?.ids||[]),selected=new Set(),output=[],today=localDate();
+ const selected=new Set(),output=[];
  for(const task of taskStatuses().filter(t=>t.remaining>0)){
-  const eligible=WORDS.filter(w=>!used.has(w.id)&&!selected.has(w.id)&&(task.category==='ALL'||w.cat===task.category));
-  const due=eligible.filter(w=>state.reviews[w.id]&&state.reviews[w.id].due<=today);
-  const newer=eligible.filter(w=>!state.reviews[w.id]);
-  const later=eligible.filter(w=>state.reviews[w.id]&&state.reviews[w.id].due>today);
-  for(const w of [...shuffle(due),...shuffle(newer),...shuffle(later)].slice(0,task.remaining)){selected.add(w.id);output.push(w.id)}
+  const pool=shuffle(WORDS.filter(w=>!state.reviews[w.id]&&!selected.has(w.id)&&(task.category==='ALL'||w.cat===task.category)));
+  for(const w of pool.slice(0,task.remaining)){selected.add(w.id);output.push(w.id)}
  }
  return output;
 }
@@ -138,9 +136,23 @@ function reviewDue(){return WORDS.filter(w=>state.reviews[w.id]&&state.reviews[w
 function mastered(){return Object.values(state.reviews).filter(r=>r.reps>=3).length}
 function checkinStreak(){let s=new Set(state.checkins),d=localDate();if(!s.has(d))d=dayPlus(d,-1);let n=0;while(s.has(d)){n++;d=dayPlus(d,-1)}return n}
 function recordStudy(w,ok){const log=todayLog();if(!log.ids.includes(w.id))log.ids.push(w.id);log[ok?'correct':'wrong']=(log[ok?'correct':'wrong']||0)+1;save()}
-function rateWord(w,grade){const prev=state.reviews[w.id]||{reps:0,interval:0,ease:2.3};let reps=grade===0?0:(prev.reps||0)+1;let ease=clamp((prev.ease||2.3)+(grade===2?.13:grade===1?-.08:-.24),1.35,2.9);let interval;
- if(grade===0)interval=1;else if(grade===1)interval=prev.interval?Math.max(1,Math.ceil(prev.interval*.75)):1;else interval=prev.reps===0?3:Math.max(2,Math.round(prev.interval*ease));
- state.reviews[w.id]={reps,ease,interval,due:dayPlus(localDate(),interval),last:localDate(),grade};recordStudy(w,grade>0)
+function reviewedTodayIds(){return state.reviewLogs[localDate()]?.ids||[]}
+function markReview(w){const day=localDate();state.reviewLogs[day] ||= {ids:[]};if(!state.reviewLogs[day].ids.includes(w.id))state.reviewLogs[day].ids.push(w.id);save()}
+function reviewCandidates(){
+ const today=localDate(),yesterday=dayPlus(today,-1),done=new Set(reviewedTodayIds()),seen=new Set(),validIds=new Set(WORDS.map(w=>w.id));
+ const y=shuffle((state.logs[yesterday]?.ids||[]).filter(id=>validIds.has(id)&&!done.has(id)&&!seen.has(id)&&(seen.add(id),true)));
+ const old=Object.entries(state.logs).filter(([d])=>d<today).flatMap(([,log])=>log.ids||[]);
+ const previous=shuffle([...old,...Object.keys(state.reviews).filter(id=>state.reviews[id]?.last<today)].filter(id=>validIds.has(id)&&!done.has(id)&&!seen.has(id)&&(seen.add(id),true)));
+ return [...y,...previous];
+}
+function previousDayCount(){return new Set((state.logs[dayPlus(localDate(),-1)]?.ids||[]).filter(id=>WORDS.some(w=>w.id===id))).size}
+function rateWord(w,grade,mode='learn'){
+ const wasNew=!state.reviews[w.id],prev=state.reviews[w.id]||{reps:0,interval:0,ease:2.3};
+ let reps=grade===0?0:(prev.reps||0)+1;
+ let ease=clamp((prev.ease||2.3)+(grade===2?.13:grade===1?-.08:-.24),1.35,2.9);
+ let interval=grade===0?1:grade===1?(prev.interval?Math.max(1,Math.ceil(prev.interval*.75)):1):(prev.reps===0?3:Math.max(2,Math.round(prev.interval*ease)));
+ state.reviews[w.id]={reps,ease,interval,due:dayPlus(localDate(),interval),last:localDate(),grade};
+ if(mode==='review')markReview(w);else if(wasNew)recordStudy(w,grade>0);else save();
 }
 function checkIn(){const d=localDate();if(!state.checkins.includes(d)){state.checkins.push(d);state.checkins.sort();save();toast('今日打卡成功。谢谢你为自己留出学习时间 🌿')}else toast('今天已经打卡啦。明天再来就好。');render()}
 function fmtDate(){return new Intl.DateTimeFormat('zh-CN',{timeZone:TIMEZONE,month:'long',day:'numeric',weekday:'long'}).format(new Date())}
@@ -149,6 +161,7 @@ function nav(v){ui.view=v;render();window.scrollTo({top:0,behavior:'auto'})}
 function setQueue(){
  const today=localDate();
  if(ui.scope==='today'){ui.category='ALL';ui.queue=plannedVocabularyQueue();ui.queueAt=0;ui.flip=false;return}
+ if(ui.scope==='yesterday'){ui.category='ALL';ui.queue=reviewCandidates().slice(0,20);ui.queueAt=0;ui.flip=false;return}
  let pool=WORDS.filter(w=>ui.category==='ALL'||w.cat===ui.category);
  let due=pool.filter(w=>state.reviews[w.id]&&state.reviews[w.id].due<=today);
  let newer=pool.filter(w=>!state.reviews[w.id]);
@@ -161,7 +174,7 @@ function setQueue(){
  ui.queue=pool.map(w=>w.id);ui.queueAt=0;ui.flip=false;
 }
 function currentWord(){return WORDS.find(w=>w.id===ui.queue[ui.queueAt])}
-function startQuiz(){let pool=WORDS.filter(w=>ui.category==='ALL'||w.cat===ui.category);pool=shuffle(pool);ui.quizQueue=pool.slice(0,10);ui.quizOptions=ui.quizQueue.map(w=>shuffle([w.zh,...shuffle(WORDS.filter(o=>o.zh!==w.zh&&o.cat===w.cat)).slice(0,3).map(o=>o.zh)]));ui.quizAt=0;ui.quizAnswer=null;ui.quizScore=0;ui.quizTyped=''}
+function startQuiz(){let pool=WORDS.filter(w=>ui.category==='ALL'||w.cat===ui.category);pool=shuffle(pool);ui.quizQueue=pool.slice(0,state.settings.quizCount);ui.quizOptions=ui.quizQueue.map(w=>shuffle([w.zh,...shuffle(WORDS.filter(o=>o.zh!==w.zh&&o.cat===w.cat)).slice(0,3).map(o=>o.zh)]));ui.quizAt=0;ui.quizAnswer=null;ui.quizScore=0;ui.quizTyped=''}
 function answerQuiz(value){if(ui.quizAnswer!==null)return;const w=ui.quizQueue[ui.quizAt];if(!w)return;const correct=ui.quizMode==='multiple'?value===w.zh:cleanTerm(value)===cleanTerm(w.es)||cleanTerm(value)===cleanTerm(w.es.replace(/^(el|la|los|las)\s+/i,''));ui.quizAnswer={value,correct};if(correct)ui.quizScore++;rateWord(w,correct?2:0);render();toast(correct?'答对了！':'没关系，看看正确答案，再继续。')}
 function cleanTerm(v){return String(v||'').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[¿?¡!.,;:()«»]/g,'').replace(/\s+/g,' ')}
 function playSpanish(text,slow=false){if(!('speechSynthesis' in window)){toast('此浏览器暂不支持语音朗读。');return}try{speechSynthesis.cancel();const s=new SpeechSynthesisUtterance(text);s.lang='es-ES';s.rate=slow?.75:.91;s.pitch=1;const vs=speechSynthesis.getVoices();const v=vs.find(x=>x.lang.toLowerCase()==='es-es')||vs.find(x=>x.lang.toLowerCase().startsWith('es'));if(v)s.voice=v;speechSynthesis.speak(s)}catch(e){toast('语音没有启动，请检查浏览器的语音权限。')}}
@@ -268,6 +281,8 @@ function onClick(e){const b=e.target.closest('[data-action],[data-nav]');if(!b)r
  if(b.dataset.nav){nav(b.dataset.nav);return}
  const a=b.dataset.action;
  if(a==='goVocab'){ui.vocabTab='cards';ui.category='ALL';ui.scope='today';setQueue();nav('vocab')}
+ else if(a==='goYesterdayReview'){ui.vocabTab='cards';ui.category='ALL';ui.scope='yesterday';setQueue();nav('vocab')}
+ else if(a==='continueReview'){ui.vocabTab='cards';ui.category='ALL';ui.scope='yesterday';setQueue();render()}
  else if(a==='openLibrary'){ui.vocabTab='library';ui.category=b.dataset.cat;ui.wordSearch='';ui.queue=[];ui.quizQueue=[];nav('vocab')}
  else if(a==='openFavorites'){ui.vocabTab='cards';ui.category='ALL';ui.scope='favorites';setQueue();nav('vocab')}
  else if(a==='goListen')nav('listen');
@@ -275,17 +290,17 @@ function onClick(e){const b=e.target.closest('[data-action],[data-nav]');if(!b)r
  else if(a==='checkin')checkIn();
  else if(a==='settings')openSettings();
  else if(a==='closeSettings'){ui.settingsOpen=false;render()}
- else if(a==='chooseCat'){ui.category=b.dataset.cat;if(ui.scope==='today'&&ui.category!==state.settings.planCategory)ui.scope='smart';ui.queue=[];ui.quizQueue=[];ui.quizAt=0;ui.flip=false;render()}
- else if(a==='chooseScope'){ui.scope=b.dataset.scope;if(ui.scope==='today')ui.category='ALL';setQueue();render()}
+ else if(a==='chooseCat'){ui.category=b.dataset.cat;if(['today','yesterday'].includes(ui.scope)&&ui.category!=='ALL')ui.scope='smart';ui.queue=[];ui.quizQueue=[];ui.quizAt=0;ui.flip=false;render()}
+ else if(a==='chooseScope'){ui.scope=b.dataset.scope;if(['today','yesterday'].includes(ui.scope))ui.category='ALL';setQueue();render()}
  else if(a==='vocabTab'){ui.vocabTab=b.dataset.tab;if(ui.vocabTab==='cards'&&!ui.queue.length)setQueue();render()}
  else if(a==='flip'){ui.flip=true;render()}
- else if(a==='rate'){const w=currentWord();if(w){rateWord(w,Number(b.dataset.grade));ui.queueAt++;ui.flip=false;render();if(ui.queueAt>=ui.queue.length)toast('本轮练习完成！')}}
+ else if(a==='rate'){const w=currentWord();if(w){rateWord(w,Number(b.dataset.grade),ui.scope==='yesterday'?'review':'learn');ui.queueAt++;ui.flip=false;render();if(ui.queueAt>=ui.queue.length)toast('本轮练习完成！')}}
  else if(a==='restartCards'){setQueue();render()}
  else if(a==='favorite'){let id=b.dataset.id;let i=state.favorites.indexOf(id);if(i<0)state.favorites.push(id);else state.favorites.splice(i,1);save();if(ui.scope==='favorites')setQueue();render()}
  else if(a==='speakWord'){let w=WORDS.find(w=>w.id===b.dataset.id);if(w)playSpanish(w.es)}
  else if(a==='speakSentence'){let w=WORDS.find(w=>w.id===b.dataset.id);if(w)playSpanish(w.example)}
  else if(a==='quizMode'){ui.quizMode=b.dataset.mode;ui.quizQueue=[];render()}
- else if(a==='startQuiz'){startQuiz();render()}
+ else if(a==='startQuiz'){const value=document.getElementById('quizCount')?.value ?? String(state.settings.quizCount);if(!validDailyGoal(value)){toast('请输入至少为 1 的整数题数。');return}state.settings.quizCount=Number(value);if(!save())return;startQuiz();render()}
  else if(a==='answerQuiz')answerQuiz(b.dataset.choice);
  else if(a==='checkTyped'){const el=document.getElementById('quizTyped');ui.quizTyped=el?.value||'';if(!ui.quizTyped.trim()){toast('先试着输入一个答案。');return}answerQuiz(ui.quizTyped)}
  else if(a==='nextQuiz'){ui.quizAt++;ui.quizAnswer=null;ui.quizTyped='';render()}
@@ -309,7 +324,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&ui.settingsOpen){ui
  if(e.key==='Enter'&&document.activeElement.id==='quizTyped'){e.preventDefault();const b=document.querySelector('[data-action="checkTyped"]');if(b)b.click()}return}
  if(ui.view==='vocab'&&ui.vocabTab==='cards'&&currentWord()){
  if(e.code==='Space'&&!ui.flip){e.preventDefault();ui.flip=true;render()}
- else if(['1','2','3'].includes(e.key)&&ui.flip){e.preventDefault();const w=currentWord();rateWord(w,Number(e.key)-1);ui.queueAt++;ui.flip=false;render()}
+ else if(['1','2','3'].includes(e.key)&&ui.flip){e.preventDefault();const w=currentWord();rateWord(w,Number(e.key)-1,ui.scope==='yesterday'?'review':'learn');ui.queueAt++;ui.flip=false;render()}
  }});
 document.getElementById('settingsModal').addEventListener('click',e=>{if(e.target.id==='settingsModal'){ui.settingsOpen=false;render()}});
 render();
