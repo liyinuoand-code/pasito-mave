@@ -144,7 +144,8 @@ function normalize(s){
  }
  const reviewLogs={};for(const [date,v] of Object.entries(s.reviewLogs&&typeof s.reviewLogs==='object'&&!Array.isArray(s.reviewLogs)?s.reviewLogs:{})){if(/^\d{4}-\d{2}-\d{2}$/.test(date)&&v&&Array.isArray(v.ids))reviewLogs[date]={ids:[...new Set(v.ids.filter(id=>typeof id==='string'))]}}
  const reviewPlans={};for(const [date,v] of Object.entries(s.reviewPlans&&typeof s.reviewPlans==='object'&&!Array.isArray(s.reviewPlans)?s.reviewPlans:{})){if(/^\d{4}-\d{2}-\d{2}$/.test(date)&&v&&Array.isArray(v.ids))reviewPlans[date]={ids:[...new Set(v.ids.filter(id=>typeof id==='string'))].slice(0,20)}}
- return {checkins:Array.isArray(s.checkins)?s.checkins:[],reviews:s.reviews&&typeof s.reviews==='object'?s.reviews:{},logs:s.logs&&typeof s.logs==='object'?s.logs:{},reviewLogs,reviewPlans,notes:s.notes&&typeof s.notes==='object'?s.notes:{},favorites:Array.isArray(s.favorites)?s.favorites:[],listenDone:s.listenDone&&typeof s.listenDone==='object'?s.listenDone:{},settings:{goal:validDailyGoal(s.settings?.goal)?Number(s.settings.goal):10,planCategory:['MAVE','B1','B2','ALL'].includes(s.settings?.planCategory)?s.settings.planCategory:'ALL',quizCount:validDailyGoal(s.settings?.quizCount)?Number(s.settings.quizCount):10},dailyTasks};
+ const dailyNewPlans={};for(const [date,v] of Object.entries(s.dailyNewPlans&&typeof s.dailyNewPlans==='object'&&!Array.isArray(s.dailyNewPlans)?s.dailyNewPlans:{})){if(/^\d{4}-\d{2}-\d{2}$/.test(date)&&v&&Array.isArray(v.ids)){const cat=['ALL','MAVE','B1','B2'].includes(v.category)?v.category:'ALL';dailyNewPlans[date]={category:cat,ids:[...new Set(v.ids.filter(id=>typeof id==='string'))]}}}
+ return {checkins:Array.isArray(s.checkins)?s.checkins:[],reviews:s.reviews&&typeof s.reviews==='object'?s.reviews:{},logs:s.logs&&typeof s.logs==='object'?s.logs:{},reviewLogs,reviewPlans,dailyNewPlans,notes:s.notes&&typeof s.notes==='object'?s.notes:{},favorites:Array.isArray(s.favorites)?s.favorites:[],listenDone:s.listenDone&&typeof s.listenDone==='object'?s.listenDone:{},settings:{goal:validDailyGoal(s.settings?.goal)?Number(s.settings.goal):10,planCategory:['MAVE','B1','B2','ALL'].includes(s.settings?.planCategory)?s.settings.planCategory:'ALL',quizCount:validDailyGoal(s.settings?.quizCount)?Number(s.settings.quizCount):10},dailyTasks};
 }
 let state=load();
 let taskStatusCache=null;
@@ -187,17 +188,49 @@ function taskStatuses(){
  taskStatusCache={day,items};
  return items;
 }
-function todayTaskStatus(){return taskStatuses().find(t=>t.date===localDate())||{date:localDate(),goal:state.settings.goal,category:state.settings.planCategory,done:0,remaining:state.settings.goal,overdue:false}}
+function todayTaskStatus(){
+ const task=taskStatuses().find(t=>t.date===localDate())||{date:localDate(),goal:state.settings.goal,category:state.settings.planCategory,done:0,remaining:state.settings.goal,overdue:false};
+ const done=Math.min(task.goal,todayNewWordIds().length);
+ return {...task,done,remaining:Math.max(0,task.goal-done)};
+}
 function overdueTasks(){return taskStatuses().filter(t=>t.overdue)}
 function overdueRemaining(){return overdueTasks().reduce((sum,t)=>sum+t.remaining,0)}
-function planRemaining(){return taskStatuses().reduce((sum,t)=>sum+t.remaining,0)}
+function planRemaining(){return todayTaskStatus().remaining}
+
+function todayNewWordIds(){
+ const today=localDate(),logged=state.logs[today]?.ids||[],valid=new Set(WORDS.map(w=>w.id)),previous=new Set();
+ for(const [date,log] of Object.entries(state.logs))if(date<today)for(const id of log?.ids||[])previous.add(id);
+ for(const [date,log] of Object.entries(state.reviewLogs))if(date<today)for(const id of log?.ids||[])previous.add(id);
+ return [...new Set(logged)].filter(id=>valid.has(id)&&!previous.has(id)&&(!state.reviews[id]?.firstLearned||state.reviews[id].firstLearned===today));
+}
+function everStudiedIds(){
+ const ids=new Set(Object.keys(state.reviews));
+ for(const log of Object.values(state.logs))for(const id of log?.ids||[])ids.add(id);
+ for(const log of Object.values(state.reviewLogs))for(const id of log?.ids||[])ids.add(id);
+ return ids;
+}
+function unseenWordCount(category='ALL'){
+ const known=everStudiedIds();
+ return WORDS.filter(w=>!known.has(w.id)&&(category==='ALL'||w.cat===category)).length;
+}
 function plannedVocabularyQueue(){
- const selected=new Set(),output=[];
- for(const task of taskStatuses().filter(t=>t.remaining>0)){
-  const pool=shuffle(WORDS.filter(w=>!state.reviews[w.id]&&!selected.has(w.id)&&(task.category==='ALL'||w.cat===task.category)));
-  for(const w of pool.slice(0,task.remaining)){selected.add(w.id);output.push(w.id)}
+ const date=localDate(),task=todayTaskStatus(),learned=new Set(todayNewWordIds());
+ const remaining=Math.max(0,task.goal-learned.size),known=everStudiedIds(),eligible=new Map(WORDS.filter(w=>!known.has(w.id)).map(w=>[w.id,w]));
+ if(!remaining)return [];
+ const before=state.dailyNewPlans[date],same=before?.category===task.category;
+ let ids=(same?before.ids:[]).filter(id=>eligible.has(id)).slice(0,remaining);
+ const selected=new Set(ids);
+ if(ids.length<remaining){
+  const extra=WORDS.filter(w=>eligible.has(w.id)&&!selected.has(w.id));
+  const preferred=shuffle(extra.filter(w=>task.category==='ALL'||w.cat===task.category));
+  const fallback=shuffle(extra.filter(w=>task.category!=='ALL'&&w.cat!==task.category));
+  for(const w of [...preferred,...fallback].slice(0,remaining-ids.length)){ids.push(w.id);selected.add(w.id)}
  }
- return output;
+ const existing=state.dailyNewPlans[date],newPlan={category:task.category,ids:[...new Set([...(same?existing.ids:[]),...ids])]};
+ if(!existing||existing.category!==newPlan.category||JSON.stringify(existing.ids)!==JSON.stringify(newPlan.ids)){
+  state.dailyNewPlans[date]=newPlan;save();
+ }
+ return ids;
 }
 function reviewDue(){return WORDS.filter(w=>state.reviews[w.id]&&state.reviews[w.id].due<=localDate()).length}
 function mastered(){return Object.values(state.reviews).filter(r=>r.reps>=3).length}
